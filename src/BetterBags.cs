@@ -115,7 +115,7 @@ namespace BetterBags
 
         public override void StartClientSide(ICoreClientAPI api)
         {
-            capi = api;
+            capi = api; capi0 = api;
             try { BagsConfig c = api.LoadModConfig<BagsConfig>("betterbags.json"); if (c != null) cfg = c; } catch (Exception) { }
             craft = new CraftDialog(api, this);
             menu = new BagsMenu(api, this);
@@ -125,8 +125,11 @@ namespace BetterBags
             api.ChatCommands.Create("bags").WithDescription("Show or hide the bag rows")
                 .HandleWith(delegate (TextCommandCallingArgs a)
                 {
-                    cfg.Hidden = !cfg.Hidden; Save(); lastSig = "";
-                    return TextCommandResult.Success(cfg.Hidden ? "Bag rows hidden" : "Bag rows shown");
+                    cfg.Hidden = !cfg.Hidden; Save(); Refresh();
+                    if (cfg.Hidden) return TextCommandResult.Success("Bag rows hidden. Type .bags again to show them.");
+                    return TextCommandResult.Success(cfg.OnlyWithInventory
+                        ? "Bag rows on. They show while your inventory is open (.bagsmode to show them all the time)."
+                        : "Bag rows shown.");
                 });
             api.ChatCommands.Create("bagsmode").WithDescription("Switch between showing the bag rows only with the inventory open, or all the time")
                 .HandleWith(delegate (TextCommandCallingArgs a)
@@ -137,9 +140,21 @@ namespace BetterBags
             api.ChatCommands.Create("bagsreset").WithDescription("Put the bag rows back in their default places")
                 .HandleWith(delegate (TextCommandCallingArgs a)
                 {
-                    cfg.Pos = ""; Save(); lastSig = "";
-                    return TextCommandResult.Success("Bag rows reset");
+                    cfg.Pos = ""; Save(); Refresh();
+                    return TextCommandResult.Success(cfg.Hidden ? "Bag row positions reset. The rows are hidden: type .bags to show them."
+                        : (cfg.OnlyWithInventory && !RowsWanted() ? "Bag row positions reset. Open your inventory to see them." : "Bag rows put back in their default places."));
                 });
+            // Shift+Tab (or .bagsinv) opens the normal full inventory screen, which is where mods like Handbook & Craft Opt show their recipe panel
+            try
+            {
+                api.Input.RegisterHotKey("betterbagsfull", "Better Bags: full inventory screen", GlKeys.Tab, HotkeyType.GUIOrOtherControls, false, false, true);
+                api.Input.SetHotKeyHandler("betterbagsfull", delegate (KeyCombination kc) { return OpenFullInventory(kc); });
+            }
+            catch (Exception e) { api.Logger.Warning("[betterbags] could not register the full inventory key: " + e.Message); }
+            api.ChatCommands.Create("bagsinv").WithDescription("Open the normal full inventory screen")
+                .HandleWith(delegate (TextCommandCallingArgs a) { return OpenFullInventory(null) ? TextCommandResult.Success("Full inventory") : TextCommandResult.Error("Could not open the full inventory"); });
+            // runs before the game draws its menus each frame, so the hidden inventory is moved away before it can be drawn
+            api.Event.RegisterRenderer(new HideRenderer(this), EnumRenderStage.Ortho, "betterbagshide");
             api.Event.LevelFinalize += HookTab;
             api.Event.RegisterGameTickListener(delegate (float dt)
             {
@@ -166,10 +181,233 @@ namespace BetterBags
             catch (Exception e) { capi.Logger.Warning("[betterbags] could not hook the inventory key: " + e.Message); }
         }
 
+        // the game's own inventory dialog, found by its type name
+        private GuiDialog FindVanillaInventory() { return FindDialog("GuiDialogInventory"); }
+
+        private GuiDialog FindDialog(string typeName)
+        {
+            string[] sources = { "LoadedGuis", "OpenedGuis" };
+            BindingFlags bf = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            for (int i = 0; i < sources.Length; i++)
+            {
+                object list = null;
+                try
+                {
+                    PropertyInfo pi = capi.Gui.GetType().GetProperty(sources[i], bf);
+                    if (pi != null) list = pi.GetValue(capi.Gui, null);
+                    else { FieldInfo fi = capi.Gui.GetType().GetField(sources[i], bf); if (fi != null) list = fi.GetValue(capi.Gui); }
+                }
+                catch (Exception) { }
+                System.Collections.IEnumerable en = list as System.Collections.IEnumerable;
+                if (en == null) continue;
+                foreach (object o in en)
+                {
+                    GuiDialog d = o as GuiDialog;
+                    if (d != null && d.GetType().Name == typeName) return d;
+                }
+            }
+            return null;
+        }
+
+        private bool pickerLogged;
+
+        // the Handbook & Craft Opt recipe panel is its own dialog; show it with the crafting menu
+        public void OpenPicker()
+        {
+            try
+            {
+                GuiDialog d = FindDialog("CraftPickerDialog");
+                if (d == null) { if (!pickerLogged) { pickerLogged = true; capi.Logger.Notification("[betterbags] recipe panel (CraftPickerDialog) not found, skipping"); } return; }
+                if (!d.IsOpened()) d.TryOpen();
+                if (!pickerLogged) { pickerLogged = true; capi.Logger.Notification("[betterbags] recipe panel opened with the crafting menu"); }
+            }
+            catch (Exception e) { capi.Logger.Warning("[betterbags] recipe panel: " + e.Message); }
+        }
+
+        private int reopenLogged;
+
+        // Handbook & Craft Opt closes its panel on its own when the game's inventory screen is not open, so while the crafting menu is open it is put back
+        public void KeepPicker()
+        {
+            try
+            {
+                GuiDialog d = FindDialog("CraftPickerDialog");
+                if (d == null || d.IsOpened()) return;
+                d.TryOpen();
+                if (reopenLogged < 3) { reopenLogged++; capi.Logger.Notification("[betterbags] recipe panel was closed by its own mod, opened again"); }
+            }
+            catch (Exception) { }
+        }
+
+        public void ClosePicker()
+        {
+            try { GuiDialog d = FindDialog("CraftPickerDialog"); if (d != null && d.IsOpened()) d.TryClose(); } catch (Exception) { }
+        }
+
+        // ---- hidden vanilla inventory: Handbook & Craft Opt only keeps its recipe panel while the game's own inventory screen is open,
+        // so that screen is opened too and moved far off screen while the small crafting menu is shown ----
+        private GuiDialog hiddenInv;
+        private bool listLogged;
+
+        private static void SetMember(object o, string name, object value)
+        {
+            if (o == null) return;
+            BindingFlags bf = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            try
+            {
+                FieldInfo fi = o.GetType().GetField(name, bf);
+                if (fi != null) { fi.SetValue(o, fi.FieldType.IsEnum ? value : Convert.ChangeType(value, fi.FieldType)); return; }
+                PropertyInfo pi = o.GetType().GetProperty(name, bf);
+                if (pi != null && pi.CanWrite) pi.SetValue(o, value, null);
+            }
+            catch (Exception) { }
+        }
+
+        private static bool moveLogged;
+        private static ICoreClientAPI capi0;
+
+        private static object GetMember(object o, string name)
+        {
+            BindingFlags bf = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            try
+            {
+                FieldInfo fi = o.GetType().GetField(name, bf);
+                if (fi != null) return fi.GetValue(o);
+                PropertyInfo pi = o.GetType().GetProperty(name, bf);
+                if (pi != null) return pi.GetValue(o, null);
+            }
+            catch (Exception) { }
+            return "n/a";
+        }
+
+        private static void MoveAway(GuiComposer c)
+        {
+            if (c == null || c.Bounds == null) return;
+            ElementBounds b = c.Bounds;
+            if (b.fixedX <= -20000) return;
+            try
+            {
+                SetMember(b, "Alignment", EnumDialogArea.None);
+                b.fixedX = -30000; b.fixedY = -30000;
+                SetMember(b, "fixedOffsetX", -30000.0); SetMember(b, "fixedOffsetY", -30000.0);
+                b.CalcWorldBounds();
+                if (!moveLogged)
+                {
+                    moveLogged = true;
+                    object rx = GetMember(b, "renderX"), ra = GetMember(b, "Alignment"), fo = GetMember(b, "fixedOffsetX");
+                    capi0.Logger.Notification("[betterbags] moved the hidden inventory away: renderX=" + rx + " alignment=" + ra + " fixedOffsetX=" + fo);
+                }
+            }
+            catch (Exception) { }
+        }
+
+        public void HideVanilla()
+        {
+            if (hiddenInv == null) return;
+            try
+            {
+                if (!hiddenInv.IsOpened()) return;
+                PropertyInfo pi = hiddenInv.GetType().GetProperty("Composers", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                object comps = pi != null ? pi.GetValue(hiddenInv, null) : null;
+                if (comps == null) { FieldInfo fi = hiddenInv.GetType().GetField("Composers", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance); if (fi != null) comps = fi.GetValue(hiddenInv); }
+                List<GuiComposer> found = new List<GuiComposer>();
+                CollectComposers(comps, found, 0);
+                if (!listLogged)
+                {
+                    listLogged = true;
+                    StringBuilder sb = new StringBuilder();
+                    sb.Append(comps == null ? "null" : comps.GetType().FullName).Append(": ").Append(found.Count).Append(" composers");
+                    capi.Logger.Notification("[betterbags] hidden inventory composers: " + sb);
+                }
+                foreach (GuiComposer gc in found) MoveAway(gc);
+            }
+            catch (Exception e) { if (!listLogged) { listLogged = true; capi.Logger.Warning("[betterbags] hide error: " + e.Message); } }
+        }
+
+        // finds every GuiComposer inside a container of unknown shape (dictionary, wrapper class with a dictionary field, list ...)
+        private static void CollectComposers(object o, List<GuiComposer> into, int depth)
+        {
+            if (o == null || depth > 2) return;
+            GuiComposer single = o as GuiComposer;
+            if (single != null) { if (!into.Contains(single)) into.Add(single); return; }
+            BindingFlags bf = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            System.Collections.IEnumerable en = o as System.Collections.IEnumerable;
+            if (en != null)
+            {
+                foreach (object item in new System.Collections.ArrayList(new List<object>(Enumerate(en))))
+                {
+                    if (item == null) continue;
+                    PropertyInfo pv = item.GetType().GetProperty("Value", bf);
+                    object val = pv != null ? pv.GetValue(item, null) : item;
+                    CollectComposers(val, into, depth + 1);
+                }
+                return;
+            }
+            FieldInfo[] fields = o.GetType().GetFields(bf);
+            for (int i = 0; i < fields.Length; i++)
+            {
+                object fv = null;
+                try { fv = fields[i].GetValue(o); } catch (Exception) { }
+                if (fv != null && !(fv is string) && (fv is System.Collections.IEnumerable || fv is GuiComposer)) CollectComposers(fv, into, depth + 1);
+            }
+        }
+
+        private static IEnumerable<object> Enumerate(System.Collections.IEnumerable en)
+        {
+            foreach (object x in en) yield return x;
+        }
+
+        public void OpenHiddenInventory()
+        {
+            try
+            {
+                GuiDialog inv = FindVanillaInventory();
+                if (inv == null) { capi.Logger.Notification("[betterbags] vanilla inventory dialog not found, recipe panel will not show on Tab"); return; }
+                if (inv.IsOpened()) inv.TryClose();
+                inv.TryOpen();
+                hiddenInv = inv;
+                HideVanilla();
+            }
+            catch (Exception e) { capi.Logger.Warning("[betterbags] hidden inventory: " + e.Message); hiddenInv = null; }
+        }
+
+        public void CloseHiddenInventory()
+        {
+            try { if (hiddenInv != null && hiddenInv.IsOpened()) hiddenInv.TryClose(); } catch (Exception) { }
+            hiddenInv = null;
+        }
+
+        public bool VanillaShownNormally()
+        {
+            GuiDialog inv = FindVanillaInventory();
+            return inv != null && inv.IsOpened() && hiddenInv == null;
+        }
+
+        private bool OpenFullInventory(KeyCombination kc)
+        {
+            try
+            {
+                if (craft != null && craft.IsOpened()) craft.TryClose();
+                GuiDialog inv = FindVanillaInventory();
+                if (inv != null)
+                {
+                    bool was = inv.IsOpened();
+                    if (was) inv.TryClose(); else inv.TryOpen();
+                    capi.Logger.Notification("[betterbags] full inventory " + (was ? "closed" : "opened") + " (" + inv.GetType().Name + ")");
+                    return true;
+                }
+                if (origInv != null) { capi.Logger.Notification("[betterbags] full inventory via the original key handler"); return origInv(kc ?? new KeyCombination()); }
+                capi.Logger.Warning("[betterbags] could not find the vanilla inventory dialog");
+            }
+            catch (Exception e) { capi.Logger.Warning("[betterbags] full inventory: " + e.Message); }
+            return false;
+        }
+
         // With OnlyWithInventory, the rows show while the crafting grid (opened by the inventory key) or the settings window is open
         private bool RowsWanted()
         {
-            return (craft != null && craft.IsOpened()) || (menu != null && menu.IsOpened());
+            // Also with the game's own inventory screen (creative inventory, or Shift+Tab full inventory)
+            return (craft != null && craft.IsOpened()) || (menu != null && menu.IsOpened()) || VanillaShownNormally();
         }
 
         private bool OnInventoryKey(KeyCombination kc)
@@ -181,7 +419,9 @@ namespace BetterBags
                     return origInv(kc);      // creative keeps the normal inventory screen
             }
             catch (Exception) { }
-            craft.Toggle();
+            if (VanillaShownNormally()) { FindVanillaInventory().TryClose(); return true; }
+            if (craft.IsOpened()) craft.TryClose();
+            else { OpenHiddenInventory(); craft.TryOpen(); }
             Refresh();      // show or hide the bag rows straight away, not at the next tick
             return true;
         }
@@ -318,6 +558,16 @@ namespace BetterBags
             rows.Clear();
             if (cfg.Hidden) lastSig = "";
         }
+    }
+
+    public class HideRenderer : IRenderer
+    {
+        private BetterBagsSystem sys;
+        public HideRenderer(BetterBagsSystem sys) { this.sys = sys; }
+        public double RenderOrder { get { return 0.0; } }
+        public int RenderRange { get { return 1; } }
+        public void OnRenderFrame(float deltaTime, EnumRenderStage stage) { try { sys.HideVanilla(); } catch (Exception) { } }
+        public void Dispose() { }
     }
 
     // One floating hotbar style row per bag. Drag the thin bar on top of it to move it.
@@ -605,7 +855,9 @@ namespace BetterBags
             y += 32;
             comp.AddSmallButton("Reset everything", delegate () { ResetAll(); return true; }, ElementBounds.Fixed(0, y, 195, 26), EnumButtonStyle.Normal, "brall");
             y += 34;
-            comp.AddStaticText("Width = slots per row (Horizontal bags). Height = slots per column (Vertical bags).", CairoFont.WhiteDetailText(), ElementBounds.Fixed(0, y, 400, 20));
+            comp.AddStaticText("Width = slots per row (horizontal bags)", CairoFont.WhiteDetailText(), ElementBounds.Fixed(0, y, 400, 20));
+            y += 20;
+            comp.AddStaticText("Height = slots per column (vertical bags)", CairoFont.WhiteDetailText(), ElementBounds.Fixed(0, y, 400, 20));
             y += 20;
             comp.AddStaticText("Drag the thin bar on top of a bag row to move it.", CairoFont.WhiteDetailText(), ElementBounds.Fixed(0, y, 400, 20));
             comp.EndChildElements();
@@ -665,7 +917,9 @@ namespace BetterBags
 
         public override void OnGuiClosed()
         {
-            if (inv != null) capi.World.Player.InventoryManager.CloseInventory(inv);
+            sys.CloseHiddenInventory();
+            // Tell the server too, like the game's own inventory window does, so it returns the crafting grid items as in vanilla
+            if (inv != null) capi.World.Player.InventoryManager.CloseInventoryAndSync(inv);
             base.OnGuiClosed();
             sys.Refresh();
         }
@@ -679,6 +933,7 @@ namespace BetterBags
         public override void OnRenderGUI(float deltaTime)
         {
             if (Sig() != styleSig) Compose();
+            sys.HideVanilla();
             SlotScale.Push(capi, sys.cfg.SlotPct);
             try { base.OnRenderGUI(deltaTime); } finally { SlotScale.Pop(); }
         }
