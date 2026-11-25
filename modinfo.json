@@ -2,7 +2,7 @@
   "type": "code",
   "name": "Better Bags (Server Edition)",
   "modid": "betterbagsse",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Server edition of yayo1's Better Bags 0.4.4: installed on the server so every player gets it. Tab opens only the crafting grid, and each equipped bag gets its own floating hotbar row, shown only while your inventory is open (.bagsmode to show them all the time). Shift+Tab (or .bagsinv) opens the normal full inventory screen. Works with Handbook & Craft Optimizer's recipe panel. Type .bags to hide or show the rows and .bagsreset to put them back.",
   "authors": [
     "yayo1"

@@ -641,6 +641,7 @@ namespace BetterBags
         {
             if (!Valid()) return;
             RefreshIfChanged();
+            if (++checkTimer >= 30) { checkTimer = 0; KeepOwnSlots(); }
             SlotScale.Push(capi, sys.cfg.SlotPct);
             try { base.OnRenderGUI(deltaTime); } finally { SlotScale.Pop(); }
         }
@@ -688,12 +689,99 @@ namespace BetterBags
             // Invisible style: no panel, no border and no visible bar, only the slots; the top strip still drags the row
             if (sys.cfg.BorderStyle == 4) comp.AddStaticCustomDraw(handle, delegate (Cairo.Context ctx, Cairo.ImageSurface surface, ElementBounds b2) { });
             else comp.AddInset(handle, 2);
-            comp.AddItemSlotGrid(inv, SendInvPacket, cols, slotIds, grid, "bagslots" + bag)
+            // The grid is made directly instead of through AddItemSlotGrid. Immersive Backpacks swaps in its own bag slots
+            // when a 4-slot grid of the backpack inventory is made that way, which hit every bag with exactly 4 slots.
+            slotGrid = new GuiElementItemSlotGrid(capi, inv, SendInvPacket, cols, slotIds, grid);
+            comp.AddInteractiveElement(slotGrid, "bagslots" + bag)
                 .EndChildElements();
             if (SingleComposer != null) SingleComposer.Dispose();
             SlotScale.Push(capi, sys.cfg.SlotPct);
             try { SingleComposer = comp.Compose(); }
             finally { SlotScale.Pop(); }
+            KeepOwnSlots();
+        }
+
+        // ---- the row must show this bag's own slots, whatever another mod changes ----
+        private GuiElementItemSlotGrid slotGrid;
+        private int checkTimer;
+        private bool warned;
+        private static FieldInfo renderedField, availableField;
+
+        private static FieldInfo FindField(Type t, string name)
+        {
+            for (; t != null; t = t.BaseType)
+            {
+                FieldInfo f = t.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+                if (f != null) return f;
+            }
+            return null;
+        }
+
+        private static int CountOf(object dict)
+        {
+            PropertyInfo c = dict == null ? null : dict.GetType().GetProperty("Count");
+            return c == null ? -1 : Convert.ToInt32(c.GetValue(dict, null));
+        }
+
+        private bool ShowsOwnSlots(object dict)
+        {
+            if (dict == null) return true;
+            PropertyInfo keysP = dict.GetType().GetProperty("Keys");
+            System.Collections.IEnumerable keys = keysP == null ? null : keysP.GetValue(dict, null) as System.Collections.IEnumerable;
+            if (keys == null) return true;
+            int i = 0;
+            foreach (object k in keys)
+            {
+                if (i >= slotIds.Length || Convert.ToInt32(k) != slotIds[i]) return false;
+                i++;
+            }
+            return i == slotIds.Length;
+        }
+
+        private void SetOwnSlots(object dict)
+        {
+            if (dict == null) return;
+            Type dt = dict.GetType();
+            MethodInfo clear = dt.GetMethod("Clear", Type.EmptyTypes);
+            MethodInfo add = dt.GetMethod("Add", new Type[] { typeof(int), typeof(ItemSlot) }) ?? dt.GetMethod("Add", new Type[] { typeof(object), typeof(object) });
+            if (clear == null || add == null) return;
+            clear.Invoke(dict, null);
+            for (int i = 0; i < slotIds.Length; i++) add.Invoke(dict, new object[] { slotIds[i], inv[slotIds[i]] });
+        }
+
+        // if the grid shows different slots than this bag's, put this bag's slots back
+        private void KeepOwnSlots()
+        {
+            if (slotGrid == null) return;
+            try
+            {
+                if (renderedField == null) renderedField = FindField(slotGrid.GetType(), "renderedSlots");
+                if (availableField == null) availableField = FindField(slotGrid.GetType(), "availableSlots");
+                object rendered = renderedField == null ? null : renderedField.GetValue(slotGrid);
+                object available = availableField == null ? null : availableField.GetValue(slotGrid);
+                if (ShowsOwnSlots(rendered) && ShowsOwnSlots(available)) return;
+                if (!warned)
+                {
+                    warned = true;
+                    capi.Logger.Notification("[betterbags] another mod changed the slots of bag row " + bag + ", putting the bag's own slots back");
+                }
+                bool sizeChanged = CountOf(rendered) != slotIds.Length;
+                SetOwnSlots(available);
+                SetOwnSlots(rendered);
+                // a different number of slots means the slot backgrounds were drawn for the wrong count, so draw them again
+                if (sizeChanged && SingleComposer != null)
+                {
+                    SlotScale.Push(capi, sys.cfg.SlotPct);
+                    try { SingleComposer.ReCompose(); } finally { SlotScale.Pop(); }
+                    rendered = renderedField == null ? null : renderedField.GetValue(slotGrid);
+                    available = availableField == null ? null : availableField.GetValue(slotGrid);
+                    if (!ShowsOwnSlots(rendered) || !ShowsOwnSlots(available)) { SetOwnSlots(available); SetOwnSlots(rendered); }
+                }
+            }
+            catch (Exception e)
+            {
+                if (!warned) { warned = true; capi.Logger.Warning("[betterbags] could not check the slots of bag row " + bag + ": " + e.Message); }
+            }
         }
 
         private void SendInvPacket(object packet) { capi.Network.SendPacketClient(packet); }
