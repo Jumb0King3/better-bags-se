@@ -100,8 +100,12 @@ namespace BetterBags
         private CraftDialog craft;
         private BagsMenu menu;
         public List<int> ActiveBags = new List<int>();
-        public bool IsVertical(int bag) { return bag >= 0 && bag < 30 && ((cfg.VertMask >> bag) & 1) == 1; }
-        public void SetVertical(int bag, bool v) { if (bag < 0 || bag >= 30) return; if (v) cfg.VertMask |= (1 << bag); else cfg.VertMask &= ~(1 << bag); }
+        // The game numbers bags by where they sit in the backpack inventory. Combat Overhaul puts the character's
+        // gear slots in front of them, so the 4 bags become 56-59 instead of 0-3. Positions, layout and the settings
+        // window use the bag's place among the equipped bags (0, 1, 2...) so they work either way.
+        public int PlaceOf(int bag) { int p = ActiveBags.IndexOf(bag); return p < 0 ? bag : p; }
+        public bool IsVertical(int bag) { bag = PlaceOf(bag); return bag >= 0 && bag < 30 && ((cfg.VertMask >> bag) & 1) == 1; }
+        public void SetVertical(int bag, bool v) { bag = PlaceOf(bag); if (bag < 0 || bag >= 30) return; if (v) cfg.VertMask |= (1 << bag); else cfg.VertMask &= ~(1 << bag); }
         private readonly List<BagRow> rows = new List<BagRow>();
         private string lastSig = "";
         private ActionConsumable<KeyCombination> origInv;
@@ -186,6 +190,7 @@ namespace BetterBags
         public bool TryGetPos(int bag, out double x, out double y)
         {
             x = 0; y = 0;
+            bag = PlaceOf(bag);
             if (string.IsNullOrEmpty(cfg.Pos)) return false;
             string[] parts = cfg.Pos.Split(';');
             for (int i = 0; i < parts.Length; i++)
@@ -196,13 +201,15 @@ namespace BetterBags
                 if (!int.TryParse(f[0], out b) || b != bag) continue;
                 if (!double.TryParse(f[1], NumberStyles.Float, CultureInfo.InvariantCulture, out px)) continue;
                 if (!double.TryParse(f[2], NumberStyles.Float, CultureInfo.InvariantCulture, out py)) continue;
-                x = px; y = py; return true;
+                x = px; y = py;
+                return OnScreen(x, y);   // a row saved off screen (e.g. a different window size) goes back to its default spot
             }
             return false;
         }
 
         public void SavePos(int bag, double x, double y)
         {
+            bag = PlaceOf(bag);
             StringBuilder sb = new StringBuilder();
             string[] parts = string.IsNullOrEmpty(cfg.Pos) ? new string[0] : cfg.Pos.Split(';');
             for (int i = 0; i < parts.Length; i++)
@@ -218,10 +225,20 @@ namespace BetterBags
 
         public void DefaultPos(int bag, out double x, out double y)
         {
+            bag = PlaceOf(bag);
             double w = capi.Render.FrameWidth / RuntimeEnv.GUIScale;
             double h = capi.Render.FrameHeight / RuntimeEnv.GUIScale;
             x = w / 2 - 210;
             y = h - 130 - (bag + 1) * 72;
+            if (y < 10) y = 10;
+            if (x < 0) x = 0;
+        }
+
+        private bool OnScreen(double x, double y)
+        {
+            double w = capi.Render.FrameWidth / RuntimeEnv.GUIScale;
+            double h = capi.Render.FrameHeight / RuntimeEnv.GUIScale;
+            return x >= -50 && y >= 0 && x < w - 40 && y < h - 20;
         }
 
         public void Save() { try { capi.StoreModConfig(cfg, "betterbags.json"); } catch (Exception) { } }
