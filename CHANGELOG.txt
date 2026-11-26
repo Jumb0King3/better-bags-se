@@ -1,0 +1,13 @@
+Better Bags (Server Edition) - Changelog
+A server edition of Better Bags by yayo1 (https://mods.vintagestory.at/betterbags). All credit for Better Bags goes to yayo1.
+
+0.4.6 (25 Nov 2026)
+- Fixed: with Immersive Backpacks installed, bags with exactly 4 slots (like the Hunter's Backpack or Spec's specialized pouch) showed Immersive Backpacks' bag slots instead of their own (#1, thanks SpeciallyCrafted for the report).
+- Bag rows now check that they show their own bag's slots, and fix themselves if another mod changes them.
+
+0.4.5 (25 Nov 2026)
+- Updated to yayo1's Better Bags 0.4.4: each equipped bag gets its own floating hotbar row, Tab opens just the crafting grid, Shift+Tab (or .bagsinv) opens the full inventory, and .bagsmode shows the rows all the time.
+- Works with Handbook & Craft Optimizer's recipe panel.
+- Fixed: closing the crafting grid now tells the server it closed, so the grid stays in sync. Items left in the grid stay there, the same as vanilla (#2, thanks NexusKnight).
+- Fixed: bag rows now show in Creative mode and alongside Combat Overhaul.
+- .bags and .bagsreset now refresh the rows straight away and tell you what they did in chat.
